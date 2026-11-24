@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bm-navy: #0F2942;
+    --bm-navy-hover: #163A5C;
+    --bm-orange: #EA580C;
+    --bm-orange-hover: #C2410C;
+    --bm-bg: #F4F6F8;
+    --bm-surface: #FFFFFF;
+    --bm-text: #1E293B;
+    --bm-muted: #475569;
+  }
+
+  body {
+    font-family: 'Public Sans', 'Noto Sans Tamil', system-ui, -apple-system, sans-serif;
+    background-color: var(--bm-bg);
+    color: var(--bm-text);
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: 'Plus Jakarta Sans', 'Noto Sans Tamil', system-ui, -apple-system, sans-serif;
+  }
+
+  .font-mono-num {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
