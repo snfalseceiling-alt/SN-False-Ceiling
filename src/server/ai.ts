@@ -1,4 +1,10 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, Type, type GenerateContentResponse } from '@google/genai';
+import {
+  buildGeminiHistory,
+  resolveChatbotRole,
+  type ChatbotRoleId,
+  type GeminiHistoryEntry,
+} from '../lib/aiChat.ts';
 
 function getAiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -15,38 +21,197 @@ function getAiClient(): GoogleGenAI | null {
   });
 }
 
-export async function askMaterialAssistant(params: {
-  question: string;
-  mode: 'assistant' | 'support' | 'compare';
+function formatGeminiError(error: unknown): string {
+  const msg = error instanceof Error ? error.message : String(error || '');
+  if (msg.includes('API_KEY_INVALID') || msg.includes('PERMISSION_DENIED') || msg.includes('403') || msg.includes('400')) {
+    return 'Gemini API key error. Please verify GEMINI_API_KEY in Settings > Secrets.';
+  }
+  if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
+    return 'Gemini quota exceeded (429). Please wait a moment or check your quota in Settings > Secrets.';
+  }
+  if (msg.includes('UNAVAILABLE') || msg.includes('503') || msg.toLowerCase().includes('high demand')) {
+    return 'The selected Gemini model is temporarily busy (503). Please retry in a few seconds or switch to Quick Lookup.';
+  }
+  if (msg.includes('NOT_FOUND') || msg.includes('404')) {
+    return 'Requested Gemini model was not found. Please contact support to verify active model configuration.';
+  }
+  if (msg.startsWith('{')) {
+    try {
+      const outer = JSON.parse(msg);
+      const innerMsg = outer?.error?.message;
+      if (typeof innerMsg === 'string') {
+        if (innerMsg.trim().startsWith('{')) {
+          const inner = JSON.parse(innerMsg);
+          if (typeof inner?.error?.message === 'string') {
+            return inner.error.message;
+          }
+        }
+        return innerMsg;
+      }
+    } catch {
+      // fall through
+    }
+  }
+  return msg || 'AI service could not complete the request.';
+}
+
+export async function runMultiTurnChat(params: {
+  message: string;
+  history?: GeminiHistoryEntry[];
+  chatbotRole?: ChatbotRoleId | string;
   contextSummary: string;
+  language?: string;
 }) {
   const ai = getAiClient();
   if (!ai) {
     throw new Error(
-      'GEMINI_API_KEY is not configured in Settings > Secrets. Please set a valid Gemini API key to use AI assistants.'
+      'GEMINI_API_KEY is not configured in Settings > Secrets. Please set a valid Gemini API key to use the BuildMate AI chatbot.'
     );
   }
 
-  const systemInstruction =
-    params.mode === 'compare'
-      ? 'You are BuildMate AI Quotation Assistant for an Indian electrical & plumbing marketplace. Explain differences between the provided real supplier quotations (brands, specifications, delivery charges, lead times, GST, and availability) factually and neutrally. Never recommend a supplier solely because its price is lowest. Never invent prices or availability not present in the provided data.'
-      : params.mode === 'support'
-        ? 'You are BuildMate AI Support Assistant. Answer platform questions about creating projects, building material lists, requesting multi-shop quotations, comparing supplier bids, PDF generation, and order tracking in India concisely and accurately.'
-        : 'You are BuildMate AI Material Assistant for Indian electrical & plumbing construction. Explain product categories, IS/ASTM standards (e.g., CPVC vs UPVC, FR-LSH copper wire gauges, MCB vs RCCB), and compatibility using only the provided catalog context where applicable. Always remind users to verify technical selections with qualified electricians, plumbers, or MEP engineers.';
+  const roleConfig = resolveChatbotRole(params.chatbotRole);
+  const langInstruction =
+    params.language === 'ta'
+      ? 'Respond in Tamil (தமிழ்) while keeping standard English/metric engineering codes (e.g., sq.mm, MCB, RCCB, CPVC, UPVC, INR, GST) clear.'
+      : 'Respond in clear Indian construction English.';
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-4-hydrogen',
-    contents: `Context from BuildMate Database:\n${params.contextSummary}\n\nUser Question:\n${params.question}`,
+  const systemInstruction = `${roleConfig.systemInstruction}\n\n${langInstruction}\n\nBuildMate Live Database Context:\n${params.contextSummary}`;
+
+  const chat = ai.chats.create({
+    model: roleConfig.model,
+    history: params.history || [],
     config: {
       systemInstruction,
     },
   });
 
-  return {
-    answer: response.text || 'No response generated.',
-    disclaimer:
-      'AI guidance is informational only. Verify specifications and quantities against approved drawings and qualified professionals.',
-  };
+  try {
+    const response: GenerateContentResponse = await chat.sendMessage({
+      message: params.message,
+    });
+
+    return {
+      answer: response.text || 'No response generated.',
+      modelUsed: roleConfig.model,
+      roleId: roleConfig.id,
+      disclaimer:
+        'AI guidance is informational only. Verify specifications and quantities against approved drawings and qualified professionals.',
+    };
+  } catch (error) {
+    throw new Error(formatGeminiError(error));
+  }
+}
+
+export async function streamMultiTurnChat(params: {
+  message: string;
+  history?: GeminiHistoryEntry[];
+  chatbotRole?: ChatbotRoleId | string;
+  contextSummary: string;
+  language?: string;
+  onChunk: (chunkText: string) => void;
+}) {
+  const ai = getAiClient();
+  if (!ai) {
+    throw new Error(
+      'GEMINI_API_KEY is not configured in Settings > Secrets. Please set a valid Gemini API key to use the BuildMate AI chatbot.'
+    );
+  }
+
+  const roleConfig = resolveChatbotRole(params.chatbotRole);
+  const langInstruction =
+    params.language === 'ta'
+      ? 'Respond in Tamil (தமிழ்) while keeping standard English/metric engineering codes (e.g., sq.mm, MCB, RCCB, CPVC, UPVC, INR, GST) clear.'
+      : 'Respond in clear Indian construction English.';
+
+  const systemInstruction = `${roleConfig.systemInstruction}\n\n${langInstruction}\n\nBuildMate Live Database Context:\n${params.contextSummary}`;
+
+  const chat = ai.chats.create({
+    model: roleConfig.model,
+    history: params.history || [],
+    config: {
+      systemInstruction,
+    },
+  });
+
+  try {
+    const streamResponse = await chat.sendMessageStream({
+      message: params.message,
+    });
+
+    let fullText = '';
+    for await (const chunk of streamResponse) {
+      const c = chunk as GenerateContentResponse;
+      if (c.text) {
+        fullText += c.text;
+        params.onChunk(c.text);
+      }
+    }
+
+    return {
+      answer: fullText || 'No response generated.',
+      modelUsed: roleConfig.model,
+      roleId: roleConfig.id,
+      disclaimer:
+        'AI guidance is informational only. Verify specifications and quantities against approved drawings and qualified professionals.',
+    };
+  } catch (error) {
+    throw new Error(formatGeminiError(error));
+  }
+}
+
+export async function askMaterialAssistant(params: {
+  question: string;
+  mode: 'assistant' | 'support' | 'compare';
+  contextSummary: string;
+  history?: Array<{ role: 'user' | 'assistant'; text: string; isError?: boolean }>;
+  chatbotRole?: ChatbotRoleId | string;
+  language?: string;
+}) {
+  if (params.mode === 'compare') {
+    const ai = getAiClient();
+    if (!ai) {
+      throw new Error(
+        'GEMINI_API_KEY is not configured in Settings > Secrets. Please set a valid Gemini API key to use AI assistants.'
+      );
+    }
+
+    const systemInstruction =
+      'You are BuildMate AI Quotation Assistant for an Indian electrical & plumbing marketplace. Explain differences between the provided real supplier quotations (brands, specifications, delivery charges, lead times, GST, and availability) factually and neutrally. Never recommend a supplier solely because its price is lowest. Never invent prices or availability not present in the provided data.';
+
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: `Context from BuildMate Database:\n${params.contextSummary}\n\nUser Question:\n${params.question}`,
+        config: {
+          systemInstruction,
+        },
+      });
+
+      return {
+        answer: response.text || 'No response generated.',
+        modelUsed: 'gemini-4-hydrogen',
+        disclaimer:
+          'AI guidance is informational only. Verify specifications and quantities against approved drawings and qualified professionals.',
+      };
+    } catch (error) {
+      throw new Error(formatGeminiError(error));
+    }
+  }
+
+  const resolvedRole: ChatbotRoleId =
+    params.chatbotRole && params.chatbotRole in { material_advisor: 1, boq_planner: 1, platform_support: 1, quick_lookup: 1 }
+      ? (params.chatbotRole as ChatbotRoleId)
+      : params.mode === 'support'
+        ? 'platform_support'
+        : 'material_advisor';
+
+  return runMultiTurnChat({
+    message: params.question,
+    history: buildGeminiHistory(params.history || []),
+    chatbotRole: resolvedRole,
+    contextSummary: params.contextSummary,
+    language: params.language,
+  });
 }
 
 export async function generateDraftChecklist(params: {

@@ -41,7 +41,9 @@ import {
   aiNaturalProductSearch,
   askMaterialAssistant,
   generateDraftChecklist,
+  streamMultiTurnChat,
 } from './src/server/ai.ts';
+import { buildGeminiHistory } from './src/lib/aiChat.ts';
 
 async function startServer() {
   const app = express();
@@ -515,29 +517,99 @@ async function startServer() {
     }
   });
 
-  // ---------- AI ASSISTANT ROUTES ----------
-  app.post('/api/ai/assistant', limitRequests(20), async (req, res) => {
+  // ---------- AI ASSISTANT & MULTI-TURN CHATBOT ROUTES ----------
+  async function buildCatalogChatContext(draftListSummary?: string): Promise<string> {
+    const cats = await db.select().from(categories);
+    const prods = await db.select().from(products).where(eq(products.isActive, true)).limit(30);
+    const parts = [
+      `Categories: ${cats.map((c) => `${c.domain}:${c.name}`).join(', ')}`,
+      `Catalogue Products:\n${prods
+        .map((p) => `- ${p.sku}: ${p.name} (${p.specification}, Est INR ${p.estimatedPrice}/${p.unit})`)
+        .join('\n')}`,
+    ];
+    if (draftListSummary && draftListSummary.trim()) {
+      parts.push(`User Current Draft Material List:\n${draftListSummary.trim()}`);
+    }
+    return parts.join('\n\n');
+  }
+
+  app.post('/api/ai/assistant', limitRequests(25), async (req, res) => {
     try {
       await ensureSeeded();
-      const { question, mode } = req.body || {};
-      if (!question || String(question).trim().length < 2) {
-        return res.status(400).json({ error: 'Please enter a question.' });
+      const { question, mode, history, chatbotRole, language, draftListSummary } = req.body || {};
+      if (!question || String(question).trim().length < 1) {
+        return res.status(400).json({ error: 'Please enter a message.' });
       }
-      const cats = await db.select().from(categories);
-      const prods = await db.select().from(products).where(eq(products.isActive, true)).limit(30);
-      const contextSummary = `Categories: ${cats.map((c) => `${c.domain}:${c.name}`).join(', ')}\nSample Products:\n${prods
-        .map((p) => `- ${p.sku}: ${p.name} (${p.specification}, Est INR ${p.estimatedPrice}/${p.unit})`)
-        .join('\n')}`;
+      const contextSummary = await buildCatalogChatContext(
+        typeof draftListSummary === 'string' ? draftListSummary : undefined
+      );
 
       const result = await askMaterialAssistant({
-        question: String(question),
+        question: String(question).trim(),
         mode: mode === 'support' ? 'support' : 'assistant',
+        history: Array.isArray(history) ? history : [],
+        chatbotRole: typeof chatbotRole === 'string' ? chatbotRole : undefined,
+        language: typeof language === 'string' ? language : 'en',
         contextSummary,
       });
       res.json(result);
     } catch (error: any) {
       console.error('AI assistant error:', error);
       res.status(500).json({ error: error.message || 'AI Assistant request failed.' });
+    }
+  });
+
+  app.post('/api/ai/chat/stream', limitRequests(25), async (req, res) => {
+    try {
+      await ensureSeeded();
+      const { message, history, chatbotRole, language, draftListSummary } = req.body || {};
+      if (!message || String(message).trim().length < 1) {
+        return res.status(400).json({ error: 'Please enter a message.' });
+      }
+
+      const contextSummary = await buildCatalogChatContext(
+        typeof draftListSummary === 'string' ? draftListSummary : undefined
+      );
+
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
+
+      const result = await streamMultiTurnChat({
+        message: String(message).trim(),
+        history: buildGeminiHistory(Array.isArray(history) ? history : []),
+        chatbotRole: typeof chatbotRole === 'string' ? chatbotRole : 'material_advisor',
+        language: typeof language === 'string' ? language : 'en',
+        contextSummary,
+        onChunk: (chunkText) => {
+          res.write(`data: ${JSON.stringify({ type: 'chunk', text: chunkText })}\n\n`);
+        },
+      });
+
+      res.write(
+        `data: ${JSON.stringify({
+          type: 'done',
+          answer: result.answer,
+          modelUsed: result.modelUsed,
+          roleId: result.roleId,
+          disclaimer: result.disclaimer,
+        })}\n\n`
+      );
+      res.end();
+    } catch (error: any) {
+      console.error('AI streaming chat error:', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: error.message || 'AI chat stream failed.' });
+      } else {
+        res.write(
+          `data: ${JSON.stringify({
+            type: 'error',
+            error: error.message || 'AI chat stream failed.',
+          })}\n\n`
+        );
+        res.end();
+      }
     }
   });
 
